@@ -1193,28 +1193,46 @@ class FarmAutomationService : Service() {
                 const anchors = [...container.querySelectorAll('a[href*="build.php?id="]')];
                 const candidates = [];
                 const seen = new Set();
+                const inferResourceType = (a) => {
+                    const nodes = []; let n = a;
+                    for (let depth=0; depth<10 && n; depth++, n=n.parentElement) nodes.push(n);
+                    const parts=[];
+                    for (const node of nodes) {
+                        parts.push(node.getAttribute?.('data-resource-type')||'', node.getAttribute?.('data-resource')||'', node.getAttribute?.('title')||'', node.getAttribute?.('aria-label')||'', String(node.className||''), clean(node.innerText||node.textContent||''));
+                        for (const img of node.querySelectorAll?.('img[alt],img[src]')||[]) parts.push(img.getAttribute('alt')||'', img.getAttribute('src')||'');
+                    }
+                    const text=parts.join(' ').toLowerCase();
+                    if (/lumber|wood|holz|bois|madera|timber/.test(text)) return 'Wood';
+                    if (/clay|lehm|argile|arcilla/.test(text)) return 'Clay';
+                    if (/iron|eisen|fer|hierro/.test(text)) return 'Iron';
+                    if (/crop|wheat|cereal|getreide|blé|cereales/.test(text)) return 'Crop';
+                    return '';
+                };
                 for (const a of anchors) {
-                    const href = a.getAttribute('href') || '';
-                    const m = href.match(/[?&]id=(\d+)/i);
+                    const hrefRaw = a.getAttribute('href') || '';
+                    const m = hrefRaw.match(/[?&]id=(\d+)/i);
                     if (!m || seen.has(m[1])) continue;
                     const fieldId = parseInt(m[1],10);
                     if (!Number.isFinite(fieldId) || fieldId < 1 || fieldId > 18) continue;
                     seen.add(m[1]);
-                    let level = -1, node = a;
-                    for (let depth=0; depth<8 && node; depth++, node=node.parentElement) {
-                        const text = clean(node.innerText || node.textContent || '');
-                        const attrs = [node.getAttribute?.('data-level')||'', node.getAttribute?.('title')||'', node.getAttribute?.('aria-label')||'', String(node.className||'')].join(' ');
-                        const lm = text.match(/(?:level|lvl)\s*(\d+)/i) || attrs.match(/level\s*(\d+)/i) || String(node.className||'').match(/level(\d+)\\b/i);
-                        if (lm) { level=parseInt(lm[1],10); break; }
+                    let level=-1, node=a;
+                    for (let depth=0; depth<10 && node; depth++, node=node.parentElement) {
+                        const text=clean(node.innerText||node.textContent||'');
+                        const attrs=[node.getAttribute?.('data-level')||'',node.getAttribute?.('title')||'',node.getAttribute?.('aria-label')||'',String(node.className||'')].join(' ');
+                        const lm=text.match(/(?:level|lvl)\s*(\d+)/i)||attrs.match(/level\s*(\d+)/i)||String(node.className||'').match(/level(\d+)\b/i);
+                        if(lm){level=parseInt(lm[1],10);break;}
                     }
-                    const disabled = a.classList.contains('disabled') || !!a.closest('.disabled') || a.getAttribute('aria-disabled') === 'true' || a.getAttribute('data-disabled') === 'true';
-                    candidates.push({fieldId, level, href, disabled});
+                    const disabled=a.classList.contains('disabled')||!!a.closest('.disabled')||a.getAttribute('aria-disabled')==='true'||a.getAttribute('data-disabled')==='true';
+                    const resourceType=inferResourceType(a);
+                    const absoluteHref=new URL(hrefRaw, location.href);
+                    absoluteHref.searchParams.set('gid','1');
+                    candidates.push({fieldId,level,href:absoluteHref.href,disabled,resourceType});
                 }
-                candidates.sort((a,b) => a.level-b.level || a.fieldId-b.fieldId);
+                candidates.sort((a,b)=>(a.level>=0?a.level:999)-(b.level>=0?b.level:999)||a.fieldId-b.fieldId);
                 const lowest = candidates.find(x => !x.disabled && x.level >= 0 && x.level < 10) || null;
                 const levels = candidates.filter(x => x.level >= 0).map(x => x.level);
                 const name = clean(active?.querySelector('.name')?.textContent || '') || 'Village ' + expectedId;
-                return JSON.stringify({ready:candidates.length >= 18, currentId, name, fieldCount:candidates.length, minLevel:levels.length ? Math.min(...levels) : -1, lowest});
+                return JSON.stringify({ready:candidates.length >= 18, currentId, name, fieldCount:candidates.length, minLevel:lowest?.level ?? (levels.length ? Math.min(...levels) : -1), lowest});
             })();
         """.trimIndent()
         automationWebView()?.evaluateJavascript(js) { raw ->
@@ -1236,7 +1254,7 @@ class FarmAutomationService : Service() {
             }
             val lowest = json.optJSONObject("lowest")
             val href = lowest?.optString("href").orEmpty().trim()
-            val minLevel = json.optInt("minLevel", -1)
+            val minLevel = lowest?.optInt("level", json.optInt("minLevel", -1)) ?: json.optInt("minLevel", -1)
             val records = loadVillageDataRecordsFromPrefs().toMutableList()
             val pos = records.indexOfFirst { it.id == expectedId }
             if (pos >= 0) {
@@ -1249,7 +1267,8 @@ class FarmAutomationService : Service() {
                 )
                 saveVillageDataRecordsForService(records)
             }
-            logEvent("AUTO REFRESH VILLAGE: $expectedName updated — min=L$minLevel target=${href.ifBlank { "-" }}")
+            val targetType = lowest?.optString("resourceType").orEmpty().ifBlank { "Resource" }
+            logEvent("AUTO REFRESH VILLAGE: $expectedName updated — min=L$minLevel type=$targetType target=${href.ifBlank { "-" }}")
             villageRefreshIndex++
             handler.postDelayed({ loadNextAutomaticVillageRefresh() }, 500L)
         }
@@ -1695,197 +1714,17 @@ class FarmAutomationService : Service() {
                 }
                 deficit.isEmpty() || deficit.all { it <= 0L } -> clickResourceUpgrade()
                 costs.size >= 4 && deficit.size >= 4 -> {
-                    // Jangan pindah ke halaman Hero Inventory.
-                    // Di halaman resource Travian, resource yang kurang ditampilkan merah
-                    // dan bisa diklik untuk membuka popup "Transfer resources".
-                    // Dari popup tersebut tombol "Transfer selected" mengambil resource
-                    // dari Hero/penyimpanan yang tersedia, lalu kita kembali ke halaman
-                    // resource yang sama untuk melakukan upgrade.
-                    pendingUpgradeCosts = LongArray(4) { deficit[it].coerceAtLeast(0L) }
+                    pendingUpgradeCosts = LongArray(4) { deficit[it].coerceAtLeast(0L).let { v -> if (v == 0L) 0L else ((v + 99L) / 100L) * 100L } }
                     pendingUpgradeUrl = webView?.url.orEmpty().ifBlank { "$server/build.php" }
                     val total = pendingUpgradeCosts.sum()
-                    logEvent("Resource Builder: resource village kurang; membuka popup Transfer resources; kebutuhan=${pendingUpgradeCosts.joinToString(",")}, total=$total")
+                    logEvent("Resource Builder: resource village kurang; kebutuhan inventory=${pendingUpgradeCosts.joinToString(",")}, total=$total")
                     inventoryUseAttempt = 0
-                    updateNotification("Resource Builder — membuka Transfer resources")
-                    handler.postDelayed({ clickRedResourceForTransfer() }, 250)
+                    updateNotification("Resource Builder — mengambil resource Hero")
+                    automationWebView()?.loadUrl("$server/hero/inventory")
                 }
                 else -> {
                     logEvent("Resource Builder: biaya upgrade tidak terbaca; village dilewati")
                     goToNextBuilderVillage()
-                }
-            }
-        }
-    }
-
-    private fun clickRedResourceForTransfer(): Unit {
-        debugTrace("ENTER clickRedResourceForTransfer")
-        if (!running || !builderInProgress || pendingUpgradeUrl.isBlank()) return
-
-        inventoryUseAttempt++
-        if (inventoryUseAttempt > 6) {
-            logEvent("Resource Builder: popup Transfer resources tidak berhasil dibuka setelah 6 percobaan")
-            inventoryUseAttempt = 0
-            pendingUpgradeUrl = ""
-            goToNextBuilderVillage()
-            return
-        }
-
-        val needed = pendingUpgradeCosts.joinToString(",")
-        val js = """
-            (() => {
-                const needed = [$needed];
-                const visible = el => {
-                    if (!el) return false;
-                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' &&
-                           r.width > 0 && r.height > 0;
-                };
-                const norm = s => (s || '').replace(/\s+/g,' ').trim().toLowerCase();
-                const isRed = el => {
-                    if (!el) return false;
-                    const s = getComputedStyle(el);
-                    const c = String(s.color || '').toLowerCase();
-                    const cls = String(el.className || '').toLowerCase();
-                    return /red|error|warn|warning|negative|missing|unavailable|bad/.test(cls) ||
-                           c === 'red' || c.includes('255, 0, 0') || c.includes('220, 0, 0') ||
-                           c.includes('200, 0, 0');
-                };
-                const meta = el => [
-                    el.id || '', el.getAttribute('class') || '',
-                    el.getAttribute('data-resource') || '', el.getAttribute('data-type') || '',
-                    el.getAttribute('title') || '', el.getAttribute('aria-label') || ''
-                ].join(' ').toLowerCase();
-
-                // Jika popup sudah terbuka, jangan klik resource lagi.
-                const transferButton = [...document.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]')]
-                    .find(el => visible(el) && !el.disabled &&
-                        /transfer selected/i.test(norm(el.innerText || el.textContent || el.value || el.title || el.getAttribute('aria-label'))));
-                if (transferButton) return 'dialog_ready';
-
-                // Travian React memasang handler khusus pada resource merah untuk membuka
-                // popup transfer Hero. Jangan hanya mencari class/color "red" karena pada
-                // beberapa tema/versi Travian warna tersebut diwariskan dari parent dan
-                // elemen kliknya sendiri tidak mempunyai class red.
-                const transferOpeners = [...document.querySelectorAll('[onclick*="openResourceTransfer"], [data-react-click*="openResourceTransfer"]')]
-                    .filter(visible);
-                if (transferOpeners.length) {
-                    const opener = transferOpeners.find(el => {
-                        const m = meta(el);
-                        return /r1|r2|r3|r4|lumber|clay|iron|crop/.test(m);
-                    }) || transferOpeners[0];
-                    opener.scrollIntoView({block:'center', inline:'center'});
-                    (opener.closest('a,button,[role=button]') || opener).click();
-                    return 'clicked_transfer_opener';
-                }
-
-                const root = document.querySelector('#contract, .buildCosts, .costs, .buildingCosts, .resourceCosts') || document.body;
-                const all = [...root.querySelectorAll('*')].filter(visible);
-                const resourceNames = ['lumber','clay','iron','crop'];
-
-                for (let i=0;i<4;i++) {
-                    if (needed[i] <= 0) continue;
-                    const token = 'r' + (i + 1);
-                    const candidates = all.filter(el => {
-                        const m = meta(el);
-                        return (m.includes(token) || m.includes(resourceNames[i])) && isRed(el);
-                    });
-                    // Pilih elemen terdalam/terkecil yang benar-benar bisa diklik.
-                    candidates.sort((a,b) => {
-                        const ar=a.getBoundingClientRect(), br=b.getBoundingClientRect();
-                        return (ar.width*ar.height) - (br.width*br.height);
-                    });
-                    const target = candidates[0];
-                    if (target) {
-                        target.scrollIntoView({block:'center', inline:'center'});
-                        target.click();
-                        return 'clicked_red:' + (i + 1);
-                    }
-
-                    // Fallback Travian: resource cost biasanya memakai icon img.r1-r4.
-                    const fallback = [...root.querySelectorAll('img.' + token + ', .' + token + ', [class~="' + token + '"]')]
-                        .filter(visible)[0];
-                    if (fallback) {
-                        fallback.scrollIntoView({block:'center', inline:'center'});
-                        (fallback.closest('a,button,[role=button]') || fallback).click();
-                        return 'clicked_fallback:' + (i + 1);
-                    }
-                }
-                return 'resource_not_found';
-            })();
-        """.trimIndent()
-
-        automationWebView()?.evaluateJavascript(js) { raw ->
-            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
-            when {
-                result == "dialog_ready" -> {
-                    handler.postDelayed({ clickTransferSelected() }, 250)
-                }
-                result.startsWith("clicked_red") || result.startsWith("clicked_fallback") || result == "clicked_transfer_opener" -> {
-                    logEvent("Resource Builder: resource merah diklik — menunggu popup Transfer resources")
-                    handler.postDelayed({ clickTransferSelected() }, 650)
-                }
-                result == "resource_not_found" -> {
-                    if (inventoryUseAttempt < 6) {
-                        handler.postDelayed({ clickRedResourceForTransfer() }, 700)
-                    } else {
-                        logEvent("Resource Builder: resource merah untuk Transfer resources tidak ditemukan")
-                        pendingUpgradeUrl = ""
-                        goToNextBuilderVillage()
-                    }
-                }
-                else -> handler.postDelayed({ clickRedResourceForTransfer() }, 700)
-            }
-        }
-    }
-
-    private fun clickTransferSelected(): Unit {
-        debugTrace("ENTER clickTransferSelected")
-        if (!running || !builderInProgress || pendingUpgradeUrl.isBlank()) return
-
-        val js = """
-            (() => {
-                const visible = el => {
-                    if (!el) return false;
-                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-                };
-                const norm = s => (s || '').replace(/\s+/g,' ').trim().toLowerCase();
-                const buttons = [...document.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]')]
-                    .filter(visible)
-                    .filter(el => !el.disabled && el.getAttribute('aria-disabled') !== 'true');
-                const btn = buttons.find(el => {
-                    const text = norm(el.innerText || el.textContent || el.value || el.title || el.getAttribute('aria-label'));
-                    return /transfer selected/i.test(text);
-                });
-                if (!btn) return 'not_found';
-                btn.scrollIntoView({block:'center', inline:'center'});
-                btn.click();
-                return 'clicked';
-            })();
-        """.trimIndent()
-
-        automationWebView()?.evaluateJavascript(js) { raw ->
-            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
-            when (result) {
-                "clicked" -> {
-                    logEvent("Resource Builder: Transfer selected diklik; kembali ke halaman resource untuk upgrade")
-                    inventoryUseAttempt = 0
-                    handler.postDelayed({
-                        if (pendingUpgradeUrl.isNotBlank()) {
-                            automationWebView()?.loadUrl(pendingUpgradeUrl)
-                            handler.postDelayed({ inspectUpgradeResources() }, 1200)
-                        }
-                    }, 1000)
-                }
-                else -> {
-                    inventoryUseAttempt++
-                    if (inventoryUseAttempt < 8) {
-                        handler.postDelayed({ clickTransferSelected() }, 700)
-                    } else {
-                        logEvent("Resource Builder: tombol Transfer selected tidak ditemukan")
-                        pendingUpgradeUrl = ""
-                        goToNextBuilderVillage()
-                    }
                 }
             }
         }

@@ -87,8 +87,6 @@ class MainActivity : Activity() {
     )
 
     private fun loadVillageDataRecords(): MutableList<VillageDataRecord> {
-        // Pure local read: jangan trace/log setiap pemanggilan. Fungsi ini dipakai
-        // oleh renderer UI dan tidak boleh memicu log refresh berantai.
         val raw = getSharedPreferences("config", MODE_PRIVATE)
             .getString(villageDataPrefsKey, "[]").orEmpty()
         val array = runCatching { org.json.JSONArray(raw) }.getOrNull() ?: org.json.JSONArray()
@@ -1467,29 +1465,41 @@ class MainActivity : Activity() {
                     : [];
                 const resourceCandidates = [];
                 const seenResourceIds = new Set();
-                for (const a of resourceAnchors) {
-                    const rawHref = a.getAttribute('href') || '';
-                    const m = rawHref.match(/[?&]id=(\d+)/i);
-                    // Simpan URL resource yang lengkap. Travian kadang merender
-                    // anchor hanya sebagai /build.php?id=3; Resource Builder
-                    // membutuhkan context resource gid=1 yang eksplisit.
-                    let href = rawHref;
-                    if (m) {
-                        try {
-                            const u = new URL(rawHref, location.origin);
-                            if (!u.searchParams.has('gid')) u.searchParams.set('gid', '1');
-                            href = u.href;
-                        } catch (_) {
-                            href = rawHref + (rawHref.includes('?') ? '&' : '?') + 'gid=1';
+                const inferResourceType = (a) => {
+                    const nodes = [];
+                    let n = a;
+                    for (let depth = 0; depth < 10 && n; depth++, n = n.parentElement) nodes.push(n);
+                    const parts = [];
+                    for (const node of nodes) {
+                        parts.push(
+                            node.getAttribute?.('data-resource-type') || '',
+                            node.getAttribute?.('data-resource') || '',
+                            node.getAttribute?.('title') || '',
+                            node.getAttribute?.('aria-label') || '',
+                            String(node.className || ''),
+                            clean(node.innerText || node.textContent || '')
+                        );
+                        for (const img of node.querySelectorAll?.('img[alt],img[src]') || []) {
+                            parts.push(img.getAttribute('alt') || '', img.getAttribute('src') || '');
                         }
                     }
+                    const text = parts.join(' ').toLowerCase();
+                    if (/lumber|wood|holz|bois|madera|timber/.test(text)) return 'Wood';
+                    if (/clay|lehm|argile|arcilla/.test(text)) return 'Clay';
+                    if (/iron|eisen|fer|hierro/.test(text)) return 'Iron';
+                    if (/crop|wheat|cereal|getreide|blé|cereales/.test(text)) return 'Crop';
+                    return '';
+                };
+                for (const a of resourceAnchors) {
+                    const hrefRaw = a.getAttribute('href') || '';
+                    const m = hrefRaw.match(/[?&]id=(\d+)/i);
                     if (!m || seenResourceIds.has(m[1])) continue;
                     const fieldId = parseInt(m[1], 10);
                     if (!Number.isFinite(fieldId) || fieldId < 1 || fieldId > 18) continue;
                     seenResourceIds.add(m[1]);
                     let level = -1;
                     let node = a;
-                    for (let depth = 0; depth < 8 && node; depth++, node = node.parentElement) {
+                    for (let depth = 0; depth < 10 && node; depth++, node = node.parentElement) {
                         const text = clean(node.innerText || node.textContent || '');
                         const attrs = [
                             node.getAttribute?.('data-level') || '',
@@ -1497,14 +1507,21 @@ class MainActivity : Activity() {
                             node.getAttribute?.('aria-label') || '',
                             String(node.className || '')
                         ].join(' ');
-                        const lm = text.match(/(?:level|lvl)\s*(\d+)/i) || attrs.match(/level\s*(\d+)/i);
+                        const lm = text.match(/(?:level|lvl)\s*(\d+)/i) || attrs.match(/level\s*(\d+)/i) || String(node.className || '').match(/level(\d+)\b/i);
                         if (lm) { level = parseInt(lm[1], 10); break; }
                     }
                     const disabled = a.classList.contains('disabled') || !!a.closest('.disabled') ||
                         a.getAttribute('aria-disabled') === 'true' || a.getAttribute('data-disabled') === 'true';
-                    resourceCandidates.push({fieldId, level, href, disabled});
+                    const resourceType = inferResourceType(a);
+                    const absoluteHref = new URL(hrefRaw, location.href);
+                    absoluteHref.searchParams.set('gid', '1');
+                    resourceCandidates.push({fieldId, level, href:absoluteHref.href, disabled, resourceType});
                 }
-                resourceCandidates.sort((a,b) => a.level - b.level || a.fieldId - b.fieldId);
+                resourceCandidates.sort((a,b) => {
+                    const al = a.level >= 0 ? a.level : 999;
+                    const bl = b.level >= 0 ? b.level : 999;
+                    return al - bl || a.fieldId - b.fieldId;
+                });
                 const lowestResource = resourceCandidates.find(x => !x.disabled && x.level >= 0 && x.level < 10) || null;
 
                 // RESOURCE BAR: Travian Legends memakai l1=wood, l2=clay,
@@ -1587,7 +1604,7 @@ class MainActivity : Activity() {
                 );
 
                 AndroidFarm.onVillageScanResult(JSON.stringify({
-                    id:expectedId, name:pageName, minLevel:Math.min(...uniqueLevels),
+                    id:expectedId, name:pageName, minLevel:(lowestResource?.level ?? Math.min(...uniqueLevels)),
                     fields:uniqueLevels, fieldNodeCount:fieldNodes.length,
                     debugFieldCount:debugFields.length, debugFields,
                     resourceContainer:true, activeId, activeName, url, resources, lowestResource
@@ -1666,13 +1683,7 @@ class MainActivity : Activity() {
 
         villageMinLevels[id] = minLevel
         if (lowestResourceLevel >= 0 && lowestResourceId.isNotBlank()) {
-            val resourceType = when (lowestResourceId.toIntOrNull()) {
-                in 1..4 -> "Wood"
-                in 5..8 -> "Clay"
-                in 9..12 -> "Iron"
-                in 13..18 -> "Crop"
-                else -> "Resource"
-            }
+            val resourceType = lowestResource?.optString("resourceType").orEmpty().ifBlank { "Resource" }
             villageMinResourceDetails[id] = resourceType to "id$lowestResourceId"
         } else {
             villageMinResourceDetails.remove(id)
@@ -2525,6 +2536,7 @@ class MainActivity : Activity() {
 
     private fun refreshRecentLogs() {
         updateVillageLinkPreviews()
+        updateVillageDatabaseView()
         if (!::recentLogs.isInitialized || isFinishing) return
         recentLogs.setTextIsSelectable(true)
         logIoExecutor.execute {
