@@ -2511,7 +2511,9 @@ class MainActivity : Activity() {
 
     private fun refreshRecentLogs() {
         updateVillageLinkPreviews()
-        updateVillageDatabaseView()
+        // Database Village tidak perlu dibaca setiap detik hanya untuk refresh log.
+        // Pembacaan berulang ini membuat loadVillageDataRecords() muncul terus saat
+        // countdown berjalan. View database diperbarui hanya ketika data berubah.
         if (!::recentLogs.isInitialized || isFinishing) return
         recentLogs.setTextIsSelectable(true)
         logIoExecutor.execute {
