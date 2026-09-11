@@ -124,9 +124,7 @@ class FarmAutomationService : Service() {
         if (!running) return@Runnable
         if (villageRefreshInProgress || villageRefreshCompleted) return@Runnable
         if (pendingStartAll || builderInProgress || loginInProgress || reloginRequested) {
-            // Jangan polling database village atau membuat retry cepat. Refresh hanya
-            // boleh mulai pada slot countdown yang sudah ditentukan.
-            logEvent("AUTO REFRESH VILLAGE: WebView sedang dipakai; menunggu 10 detik")
+            logEvent("AUTO REFRESH VILLAGE: WebView sedang dipakai; refresh ditunda 10 detik")
             handler.postDelayed(delayedVillageRefreshRunnable, 10_000L)
             return@Runnable
         }
@@ -136,20 +134,11 @@ class FarmAutomationService : Service() {
     private fun scheduleVillageRefreshForNextRun(nextRunAt: Long) {
         handler.removeCallbacks(delayedVillageRefreshRunnable)
         if (!running) return
-
-        // Countdown dimulai sekarang. Refresh harus mulai tepat +1 menit dari sini,
-        // BUKAN 1 menit sebelum countdown berakhir.
-        val countdownStartedAt = System.currentTimeMillis()
-        val refreshAt = countdownStartedAt + 60_000L
+        val refreshAt = nextRunAt - 60_000L
         val delay = (refreshAt - System.currentTimeMillis()).coerceAtLeast(0L)
-
         scheduledRefreshForNextRun = true
         countdownCyclePending = true
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putLong("countdown_started_at", countdownStartedAt)
-            .apply()
-
-        logEvent("AUTO REFRESH VILLAGE: dijadwalkan +1 menit setelah Countdown dimulai — ${timeFormat.format(Date(refreshAt))}")
+        logEvent("AUTO REFRESH VILLAGE: dijadwalkan 1 menit setelah Countdown dimulai — ${timeFormat.format(Date(refreshAt))}")
         handler.postDelayed(delayedVillageRefreshRunnable, delay)
     }
     private val cycleWatchdogRunnable: Runnable = Runnable {
@@ -266,9 +255,6 @@ class FarmAutomationService : Service() {
 
     private var villageRefreshInProgress = false
     private var villageRefreshCompleted = false
-    private var villageRefreshClosed = true
-    private var villageRefreshStartedAt = 0L
-    private var villageRefreshTimeoutRunnable: Runnable? = null
     private var villageRefreshIndex = 0
     private var villageRefreshRetry = 0
     private var villageRefreshInspectInFlight = false
@@ -351,21 +337,13 @@ class FarmAutomationService : Service() {
 
         val cycleActive = prefs.getBoolean("cycle_active", false)
         val savedNextAt = prefs.getLong("next_run_at", 0L)
-        val countdownStartedAt = prefs.getLong("countdown_started_at", 0L)
-        val now = System.currentTimeMillis()
-        val delay = savedNextAt - now
+        val delay = savedNextAt - System.currentTimeMillis()
 
         handler.postDelayed({
             if (!running) return@postDelayed
             recoveringService = false
             if (cycleActive || delay <= 0L) {
-                // Jika proses mati setelah countdown berakhir, pastikan refresh tetap
-                // mendapat kesempatan selesai/timeout sebelum cycle benar-benar jalan.
-                if (!villageRefreshCompleted && !villageRefreshInProgress) {
-                    villageRefreshClosed = false
-                    startAutomaticVillageRefresh()
-                }
-                logEvent("RECOVERY: siklus terakhir belum selesai/interval sudah lewat; menunggu REFRESH VILLAGE lalu memulai siklus")
+                logEvent("RECOVERY: siklus terakhir belum selesai/interval sudah lewat; memulai ulang siklus")
                 triggerScheduledCycle()
             } else {
                 logEvent("RECOVERY: scheduler dipulihkan; run berikutnya dalam ${((delay + 999L) / 1000L)} detik")
@@ -373,19 +351,9 @@ class FarmAutomationService : Service() {
                 nextAt = savedNextAt
                 handler.postDelayed(nextRunRunnable, delay)
                 updateNextRun(delay)
-
-                // Pertahankan titik +1 menit dari countdown yang tersimpan.
-                val refreshAt = if (countdownStartedAt > 0L) {
-                    countdownStartedAt + 60_000L
-                } else {
-                    now + 60_000L
-                }
-                handler.removeCallbacks(delayedVillageRefreshRunnable)
-                scheduledRefreshForNextRun = true
-                countdownCyclePending = true
-                val refreshDelay = (refreshAt - System.currentTimeMillis()).coerceAtLeast(0L)
-                logEvent("RECOVERY: AUTO REFRESH VILLAGE dijadwalkan ${timeFormat.format(Date(refreshAt))}")
-                handler.postDelayed(delayedVillageRefreshRunnable, refreshDelay)
+                // Recovery mempertahankan urutan: countdown -> (1 menit kemudian)
+                // Refresh Village -> countdown berakhir -> cycle.
+                scheduleVillageRefreshForNextRun(nextAt)
             }
         }, 800L)
     }
@@ -452,9 +420,9 @@ class FarmAutomationService : Service() {
                     super.onPageFinished(view, url)
                     if (url == null || !running) return
                     lastAutomationUrl = url
-                    // Refresh Village hanya dipicu dari handlePageAfterConsent().
-                    // Jangan jadwalkan inspect kedua di onPageFinished karena dua
-                    // callback dapat memproses village index yang sama/berikutnya.
+                    if (villageRefreshInProgress && url.contains("dorf1.php", ignoreCase = true)) {
+                        handler.postDelayed({ inspectAutomaticVillageRefresh() }, 700L)
+                    }
                     handlePageAfterConsent(url, url.lowercase(Locale.US), 0)
                 }
 
@@ -523,8 +491,6 @@ class FarmAutomationService : Service() {
         countdownCyclePending = true
         villageRefreshInProgress = false
         villageRefreshCompleted = false
-        villageRefreshClosed = false
-        villageRefreshStartedAt = 0L
         startAutomaticVillageRefresh()
     }
 
@@ -549,13 +515,14 @@ class FarmAutomationService : Service() {
             .apply()
         logEvent("Siklus dimulai pada $now")
         handler.removeCallbacks(cycleWatchdogRunnable)
+        // delayedVillageRefreshRunnable TIDAK dibatalkan: refresh adalah pekerjaan
+        // yang sengaja berjalan 1 menit sebelum countdown berakhir.
+        // Farm List + verifikasi dapat membutuhkan >60 detik untuk banyak village.
+        // Watchdog 5 menit mencegah false timeout sebelum Resource Builder sempat jalan.
         handler.postDelayed(cycleWatchdogRunnable, 15 * 60_000L)
-
-        // Cycle TIDAK boleh memakai WebView sebelum Auto Refresh benar-benar
-        // selesai/timeout dan sudah ditutup.
-        if (villageRefreshInProgress || !villageRefreshClosed || !villageRefreshCompleted) {
-            logEvent("Siklus: menunggu AUTO REFRESH VILLAGE ditutup sebelum cycle dimulai")
-            handler.postDelayed({ if (running) triggerScheduledCycleActions() }, 1_000L)
+        if (!villageRefreshCompleted && villageRefreshInProgress) {
+            logEvent("Siklus: Refresh Village masih berjalan; Farm List menunggu agar WebView tidak bentrok")
+            handler.postDelayed({ if (running) triggerScheduledCycleActions() }, 500L)
             return
         }
         triggerScheduledCycleActions()
@@ -1148,17 +1115,11 @@ class FarmAutomationService : Service() {
     private fun startAutomaticVillageRefresh() {
         debugTrace("ENTER startAutomaticVillageRefresh")
         if (!running || villageRefreshInProgress || villageRefreshCompleted) return
-
-        // Snapshot checklist SEKALI di awal refresh. Setelah ini countdown tidak
-        // perlu memanggil loadVillageDataRecords berulang-ulang.
-        val records = loadVillageDataRecordsFromPrefs()
-        val selectedRecords = records.filter { it.isChecklist && it.id.isNotBlank() }
-        if (selectedRecords.isEmpty()) {
-            villageRefreshInProgress = false
+        val records = loadVillageDataRecordsFromPrefs().filter { it.isChecklist && it.id.isNotBlank() }
+        if (records.isEmpty()) {
             villageRefreshCompleted = true
-            villageRefreshClosed = true
-            scheduledRefreshForNextRun = false
-            logEvent("AUTO REFRESH VILLAGE: tidak ada village checklist; refresh ditutup")
+            villageRefreshInProgress = false
+            logEvent("AUTO REFRESH VILLAGE: tidak ada village checklist; refresh dianggap selesai")
             if (initialCyclePending) {
                 initialCyclePending = false
                 countdownCyclePending = false
@@ -1168,84 +1129,37 @@ class FarmAutomationService : Service() {
             }
             return
         }
-
         ensureServiceWebView()
-        villageRefreshVillages = selectedRecords.map { it.id to it.namaVillage }.toMutableList()
+        villageRefreshVillages = records.map { it.id to it.namaVillage }.toMutableList()
         villageRefreshIndex = 0
         villageRefreshRetry = 0
         villageRefreshInspectInFlight = false
         villageRefreshInProgress = true
         villageRefreshCompleted = false
-        villageRefreshClosed = false
-        villageRefreshStartedAt = System.currentTimeMillis()
-
-        // Hard timeout 2 menit. Timeout menghentikan seluruh state refresh agar
-        // cycle tidak pernah menunggu selamanya.
-        villageRefreshTimeoutRunnable?.let { handler.removeCallbacks(it) }
-        val timeoutRunnable = Runnable {
-            if (!running || !villageRefreshInProgress) return@Runnable
-            val elapsed = System.currentTimeMillis() - villageRefreshStartedAt
-            if (elapsed < 120_000L) {
-                villageRefreshTimeoutRunnable?.let {
-                    handler.postDelayed(it, 120_000L - elapsed)
-                }
-                return@Runnable
-            }
-            closeAutomaticVillageRefresh("TIMEOUT 2 MENIT — ditutup paksa")
-        }
-        villageRefreshTimeoutRunnable = timeoutRunnable
-        handler.postDelayed(timeoutRunnable, 120_000L)
-
         val selectedIds = villageRefreshVillages.map { it.first }.toSet()
-        val cleared = records.map {
+        val cleared = loadVillageDataRecordsFromPrefs().map {
             if (it.id in selectedIds) it.copy(linkResource = "", minLvl = -1) else it
         }
         saveVillageDataRecordsForService(cleared)
-        logEvent("AUTO REFRESH VILLAGE: mulai — ${villageRefreshVillages.size} village checklist; target lama dibersihkan; batas 2 menit")
+        logEvent("AUTO REFRESH VILLAGE: mulai — ${villageRefreshVillages.size} village checklist; target lama dibersihkan")
         updateNotification("Refresh Village — 0/${villageRefreshVillages.size}")
         loadNextAutomaticVillageRefresh()
-    }
-
-    private fun closeAutomaticVillageRefresh(reason: String) {
-        debugTrace("ENTER closeAutomaticVillageRefresh")
-        if (!villageRefreshInProgress && villageRefreshClosed) return
-
-        villageRefreshTimeoutRunnable?.let { handler.removeCallbacks(it) }
-        villageRefreshTimeoutRunnable = null
-        villageRefreshInProgress = false
-        villageRefreshCompleted = true
-        villageRefreshClosed = true
-        villageRefreshInspectInFlight = false
-        villageRefreshRetry = 0
-        villageRefreshVillages.clear()
-        villageRefreshIndex = 0
-        try {
-            automationWebView()?.stopLoading()
-        } catch (_: Exception) {}
-
-        scheduledRefreshForNextRun = false
-        logEvent("AUTO REFRESH VILLAGE: $reason; WebView refresh ditutup")
-        updateNotification("Refresh Village ditutup — menunggu Countdown")
-
-        // Jika countdown sudah berakhir saat refresh selesai/timeout, lepaskan cycle.
-        val nextRunAt = getSharedPreferences(PREFS, MODE_PRIVATE).getLong("next_run_at", 0L)
-        if (nextRunAt > 0L && System.currentTimeMillis() >= nextRunAt &&
-            !getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("cycle_active", false)) {
-            handler.removeCallbacks(nextRunRunnable)
-            handler.post(nextRunRunnable)
-        } else if (initialCyclePending) {
-            initialCyclePending = false
-            countdownCyclePending = false
-            triggerScheduledCycle()
-        }
     }
 
     private fun loadNextAutomaticVillageRefresh() {
         if (!running || !villageRefreshInProgress) return
         if (villageRefreshIndex >= villageRefreshVillages.size) {
-            val completedCount = villageRefreshVillages.size
-            closeAutomaticVillageRefresh("selesai — $completedCount village diperbarui")
-            if (!initialCyclePending) {
+            villageRefreshInProgress = false
+            villageRefreshCompleted = true
+            villageRefreshRetry = 0
+            logEvent("AUTO REFRESH VILLAGE: selesai — ${villageRefreshVillages.size} village diperbarui")
+            updateNotification("Refresh Village selesai — data resource terbaru tersimpan")
+            if (initialCyclePending) {
+                initialCyclePending = false
+                countdownCyclePending = false
+                logEvent("AUTO REFRESH VILLAGE: siklus pertama siap dimulai")
+                triggerScheduledCycle()
+            } else {
                 maybeStartResourceBuilderAfterRefresh()
             }
             return
@@ -1280,8 +1194,21 @@ class FarmAutomationService : Service() {
                 const candidates = [];
                 const seen = new Set();
                 for (const a of anchors) {
-                    const href = a.getAttribute('href') || '';
-                    const m = href.match(/[?&]id=(\d+)/i);
+                    const rawHref = a.getAttribute('href') || '';
+                    const m = rawHref.match(/[?&]id=(\d+)/i);
+                    // Normalisasi LinkResource saat refresh. Travian sering
+                    // memberi /build.php?id=N; tambahkan gid=1 agar URL target
+                    // resource lengkap dan stabil untuk siklus berikutnya.
+                    let href = rawHref;
+                    if (m) {
+                        try {
+                            const u = new URL(rawHref, location.origin);
+                            if (!u.searchParams.has('gid')) u.searchParams.set('gid', '1');
+                            href = u.href;
+                        } catch (_) {
+                            href = rawHref + (rawHref.includes('?') ? '&' : '?') + 'gid=1';
+                        }
+                    }
                     if (!m || seen.has(m[1])) continue;
                     const fieldId = parseInt(m[1],10);
                     if (!Number.isFinite(fieldId) || fieldId < 1 || fieldId > 18) continue;
@@ -1461,73 +1388,22 @@ class FarmAutomationService : Service() {
     private fun openSavedBuilderResource(): Unit {
         debugTrace("ENTER openSavedBuilderResource")
         if (!running || !builderInProgress || pendingBuilderResourceHref.isBlank()) return
-        val (villageId, villageName) = builderVillages.getOrNull(builderVillageIndex)
-            ?: return
-        val expectedId = villageId
-        val href = absoluteBuilderHref(pendingBuilderResourceHref)
-        val hrefJson = JSONObject.quote(href)
-        builderStage = "OPEN_RESOURCE"
-        val idJson = JSONObject.quote(expectedId)
+        val (villageId, villageName) = builderVillages.getOrNull(builderVillageIndex) ?: return
 
-        val js = """
-            (() => {
-                const id = $idJson;
-                const targetHref = $hrefJson;
-                const current = location.href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
-                if (current !== id) return JSON.stringify({state:'wrong_village', current, expected:id});
-
-                // Pastikan target href yang tersimpan memang berasal dari village ini.
-                const anchors = [...document.querySelectorAll('#resourceFieldContainer a[href*="build.php?id="], a[href*="build.php?id="]')];
-                const wanted = targetHref.split('#')[0];
-                const found = anchors.find(a => {
-                    const raw = a.getAttribute('href') || '';
-                    return raw === targetHref || raw === wanted || a.href === targetHref || a.href === wanted;
-                });
-
-                if (found) {
-                    found.scrollIntoView({block:'center'});
-                    found.click();
-                    return JSON.stringify({state:'clicked', href:found.getAttribute('href') || found.href});
-                }
-
-                // Jika skin Travian tidak merender anchor resource di DOM, gunakan
-                // href tersimpan secara langsung. Ini tetap menuju field yang sama.
-                location.href = targetHref;
-                return JSON.stringify({state:'load_saved_href', href:targetHref});
-            })();
-        """.trimIndent()
-
-        automationWebView()?.evaluateJavascript(js) { raw ->
-            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
-            when {
-                result.contains("wrong_village") -> {
-                    logEvent("Resource Builder: village aktif salah saat membuka target; expected=$expectedId; retry")
-                    if (builderAttempt < 4) {
-                        builderAttempt++
-                        automationWebView()?.loadUrl("$server/dorf1.php")
-                    } else {
-                        builderVillageClickInProgress = false
-                        pendingBuilderResourceHref = ""
-                        goToNextBuilderVillage()
-                    }
-                }
-                result.contains("clicked") || result.contains("load_saved_href") -> {
-                    builderVillageClickInProgress = false
-                    logEvent("Resource Builder: $villageName — membuka target resource tersimpan $href")
-                }
-                else -> {
-                    if (builderAttempt < 4) {
-                        builderAttempt++
-                        handler.postDelayed({ openSavedBuilderResource() }, 700)
-                    } else {
-                        builderVillageClickInProgress = false
-                        pendingBuilderResourceHref = ""
-                        logEvent("Resource Builder: gagal membuka target resource tersimpan untuk $villageName")
-                        goToNextBuilderVillage()
-                    }
-                }
-            }
+        // LinkResource disimpan saat Refresh Village. Jangan cari ulang anchor
+        // di dorf1: Travian dapat meng-canonicalize /dorf1.php?newdid=ID menjadi
+        // /dorf1.php sehingga pemeriksaan village aktif dari URL menjadi kosong.
+        // Buka target tersimpan langsung dan paksa context village dengan newdid.
+        val baseHref = absoluteBuilderHref(pendingBuilderResourceHref)
+        val targetHref = if (Regex("[?&]newdid=", RegexOption.IGNORE_CASE).containsMatchIn(baseHref)) {
+            baseHref
+        } else {
+            baseHref + (if (baseHref.contains("?")) "&" else "?") + "newdid=$villageId"
         }
+        builderStage = "OPEN_RESOURCE"
+        builderVillageClickInProgress = false
+        logEvent("Resource Builder: $villageName — membuka Link Resource tersimpan: $baseHref (village=$villageId)")
+        automationWebView()?.loadUrl(targetHref)
     }
 
     private fun saveDebugResourceBuilderVillageLink(villageId: String, savedVillageHref: String = "") {
@@ -2432,11 +2308,8 @@ class FarmAutomationService : Service() {
         running = false
         handler.removeCallbacks(cycleWatchdogRunnable)
         handler.removeCallbacks(delayedVillageRefreshRunnable)
-        villageRefreshTimeoutRunnable?.let { handler.removeCallbacks(it) }
-        villageRefreshTimeoutRunnable = null
         villageRefreshInProgress = false
         villageRefreshCompleted = false
-        villageRefreshClosed = true
         villageRefreshInspectInFlight = false
         villageRefreshVillages.clear()
         pendingStartAll = false

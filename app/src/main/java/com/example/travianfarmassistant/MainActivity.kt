@@ -1467,8 +1467,21 @@ class MainActivity : Activity() {
                 const resourceCandidates = [];
                 const seenResourceIds = new Set();
                 for (const a of resourceAnchors) {
-                    const href = a.getAttribute('href') || '';
-                    const m = href.match(/[?&]id=(\d+)/i);
+                    const rawHref = a.getAttribute('href') || '';
+                    const m = rawHref.match(/[?&]id=(\d+)/i);
+                    // Simpan URL resource yang lengkap. Travian kadang merender
+                    // anchor hanya sebagai /build.php?id=3; Resource Builder
+                    // membutuhkan context resource gid=1 yang eksplisit.
+                    let href = rawHref;
+                    if (m) {
+                        try {
+                            const u = new URL(rawHref, location.origin);
+                            if (!u.searchParams.has('gid')) u.searchParams.set('gid', '1');
+                            href = u.href;
+                        } catch (_) {
+                            href = rawHref + (rawHref.includes('?') ? '&' : '?') + 'gid=1';
+                        }
+                    }
                     if (!m || seenResourceIds.has(m[1])) continue;
                     const fieldId = parseInt(m[1], 10);
                     if (!Number.isFinite(fieldId) || fieldId < 1 || fieldId > 18) continue;
@@ -2511,9 +2524,7 @@ class MainActivity : Activity() {
 
     private fun refreshRecentLogs() {
         updateVillageLinkPreviews()
-        // Database Village tidak perlu dibaca setiap detik hanya untuk refresh log.
-        // Pembacaan berulang ini membuat loadVillageDataRecords() muncul terus saat
-        // countdown berjalan. View database diperbarui hanya ketika data berubah.
+        updateVillageDatabaseView()
         if (!::recentLogs.isInitialized || isFinishing) return
         recentLogs.setTextIsSelectable(true)
         logIoExecutor.execute {
