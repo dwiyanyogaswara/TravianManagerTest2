@@ -87,7 +87,8 @@ class MainActivity : Activity() {
     )
 
     private fun loadVillageDataRecords(): MutableList<VillageDataRecord> {
-        debugTrace("ENTER loadVillageDataRecords")
+        // Pure local read: jangan trace/log setiap pemanggilan. Fungsi ini dipakai
+        // oleh renderer UI dan tidak boleh memicu log refresh berantai.
         val raw = getSharedPreferences("config", MODE_PRIVATE)
             .getString(villageDataPrefsKey, "[]").orEmpty()
         val array = runCatching { org.json.JSONArray(raw) }.getOrNull() ?: org.json.JSONArray()
@@ -2524,7 +2525,6 @@ class MainActivity : Activity() {
 
     private fun refreshRecentLogs() {
         updateVillageLinkPreviews()
-        updateVillageDatabaseView()
         if (!::recentLogs.isInitialized || isFinishing) return
         recentLogs.setTextIsSelectable(true)
         logIoExecutor.execute {
