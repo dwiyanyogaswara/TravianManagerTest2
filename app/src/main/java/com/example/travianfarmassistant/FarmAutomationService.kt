@@ -1194,21 +1194,8 @@ class FarmAutomationService : Service() {
                 const candidates = [];
                 const seen = new Set();
                 for (const a of anchors) {
-                    const rawHref = a.getAttribute('href') || '';
-                    const m = rawHref.match(/[?&]id=(\d+)/i);
-                    // Normalisasi LinkResource saat refresh. Travian sering
-                    // memberi /build.php?id=N; tambahkan gid=1 agar URL target
-                    // resource lengkap dan stabil untuk siklus berikutnya.
-                    let href = rawHref;
-                    if (m) {
-                        try {
-                            const u = new URL(rawHref, location.origin);
-                            if (!u.searchParams.has('gid')) u.searchParams.set('gid', '1');
-                            href = u.href;
-                        } catch (_) {
-                            href = rawHref + (rawHref.includes('?') ? '&' : '?') + 'gid=1';
-                        }
-                    }
+                    const href = a.getAttribute('href') || '';
+                    const m = href.match(/[?&]id=(\d+)/i);
                     if (!m || seen.has(m[1])) continue;
                     const fieldId = parseInt(m[1],10);
                     if (!Number.isFinite(fieldId) || fieldId < 1 || fieldId > 18) continue;
@@ -1388,22 +1375,73 @@ class FarmAutomationService : Service() {
     private fun openSavedBuilderResource(): Unit {
         debugTrace("ENTER openSavedBuilderResource")
         if (!running || !builderInProgress || pendingBuilderResourceHref.isBlank()) return
-        val (villageId, villageName) = builderVillages.getOrNull(builderVillageIndex) ?: return
-
-        // LinkResource disimpan saat Refresh Village. Jangan cari ulang anchor
-        // di dorf1: Travian dapat meng-canonicalize /dorf1.php?newdid=ID menjadi
-        // /dorf1.php sehingga pemeriksaan village aktif dari URL menjadi kosong.
-        // Buka target tersimpan langsung dan paksa context village dengan newdid.
-        val baseHref = absoluteBuilderHref(pendingBuilderResourceHref)
-        val targetHref = if (Regex("[?&]newdid=", RegexOption.IGNORE_CASE).containsMatchIn(baseHref)) {
-            baseHref
-        } else {
-            baseHref + (if (baseHref.contains("?")) "&" else "?") + "newdid=$villageId"
-        }
+        val (villageId, villageName) = builderVillages.getOrNull(builderVillageIndex)
+            ?: return
+        val expectedId = villageId
+        val href = absoluteBuilderHref(pendingBuilderResourceHref)
+        val hrefJson = JSONObject.quote(href)
         builderStage = "OPEN_RESOURCE"
-        builderVillageClickInProgress = false
-        logEvent("Resource Builder: $villageName — membuka Link Resource tersimpan: $baseHref (village=$villageId)")
-        automationWebView()?.loadUrl(targetHref)
+        val idJson = JSONObject.quote(expectedId)
+
+        val js = """
+            (() => {
+                const id = $idJson;
+                const targetHref = $hrefJson;
+                const current = location.href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                if (current !== id) return JSON.stringify({state:'wrong_village', current, expected:id});
+
+                // Pastikan target href yang tersimpan memang berasal dari village ini.
+                const anchors = [...document.querySelectorAll('#resourceFieldContainer a[href*="build.php?id="], a[href*="build.php?id="]')];
+                const wanted = targetHref.split('#')[0];
+                const found = anchors.find(a => {
+                    const raw = a.getAttribute('href') || '';
+                    return raw === targetHref || raw === wanted || a.href === targetHref || a.href === wanted;
+                });
+
+                if (found) {
+                    found.scrollIntoView({block:'center'});
+                    found.click();
+                    return JSON.stringify({state:'clicked', href:found.getAttribute('href') || found.href});
+                }
+
+                // Jika skin Travian tidak merender anchor resource di DOM, gunakan
+                // href tersimpan secara langsung. Ini tetap menuju field yang sama.
+                location.href = targetHref;
+                return JSON.stringify({state:'load_saved_href', href:targetHref});
+            })();
+        """.trimIndent()
+
+        automationWebView()?.evaluateJavascript(js) { raw ->
+            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
+            when {
+                result.contains("wrong_village") -> {
+                    logEvent("Resource Builder: village aktif salah saat membuka target; expected=$expectedId; retry")
+                    if (builderAttempt < 4) {
+                        builderAttempt++
+                        automationWebView()?.loadUrl("$server/dorf1.php")
+                    } else {
+                        builderVillageClickInProgress = false
+                        pendingBuilderResourceHref = ""
+                        goToNextBuilderVillage()
+                    }
+                }
+                result.contains("clicked") || result.contains("load_saved_href") -> {
+                    builderVillageClickInProgress = false
+                    logEvent("Resource Builder: $villageName — membuka target resource tersimpan $href")
+                }
+                else -> {
+                    if (builderAttempt < 4) {
+                        builderAttempt++
+                        handler.postDelayed({ openSavedBuilderResource() }, 700)
+                    } else {
+                        builderVillageClickInProgress = false
+                        pendingBuilderResourceHref = ""
+                        logEvent("Resource Builder: gagal membuka target resource tersimpan untuk $villageName")
+                        goToNextBuilderVillage()
+                    }
+                }
+            }
+        }
     }
 
     private fun saveDebugResourceBuilderVillageLink(villageId: String, savedVillageHref: String = "") {
@@ -1657,17 +1695,197 @@ class FarmAutomationService : Service() {
                 }
                 deficit.isEmpty() || deficit.all { it <= 0L } -> clickResourceUpgrade()
                 costs.size >= 4 && deficit.size >= 4 -> {
-                    pendingUpgradeCosts = LongArray(4) { deficit[it].coerceAtLeast(0L).let { v -> if (v == 0L) 0L else ((v + 99L) / 100L) * 100L } }
+                    // Jangan pindah ke halaman Hero Inventory.
+                    // Di halaman resource Travian, resource yang kurang ditampilkan merah
+                    // dan bisa diklik untuk membuka popup "Transfer resources".
+                    // Dari popup tersebut tombol "Transfer selected" mengambil resource
+                    // dari Hero/penyimpanan yang tersedia, lalu kita kembali ke halaman
+                    // resource yang sama untuk melakukan upgrade.
+                    pendingUpgradeCosts = LongArray(4) { deficit[it].coerceAtLeast(0L) }
                     pendingUpgradeUrl = webView?.url.orEmpty().ifBlank { "$server/build.php" }
                     val total = pendingUpgradeCosts.sum()
-                    logEvent("Resource Builder: resource village kurang; kebutuhan inventory=${pendingUpgradeCosts.joinToString(",")}, total=$total")
+                    logEvent("Resource Builder: resource village kurang; membuka popup Transfer resources; kebutuhan=${pendingUpgradeCosts.joinToString(",")}, total=$total")
                     inventoryUseAttempt = 0
-                    updateNotification("Resource Builder — mengambil resource Hero")
-                    automationWebView()?.loadUrl("$server/hero/inventory")
+                    updateNotification("Resource Builder — membuka Transfer resources")
+                    handler.postDelayed({ clickRedResourceForTransfer() }, 250)
                 }
                 else -> {
                     logEvent("Resource Builder: biaya upgrade tidak terbaca; village dilewati")
                     goToNextBuilderVillage()
+                }
+            }
+        }
+    }
+
+    private fun clickRedResourceForTransfer(): Unit {
+        debugTrace("ENTER clickRedResourceForTransfer")
+        if (!running || !builderInProgress || pendingUpgradeUrl.isBlank()) return
+
+        inventoryUseAttempt++
+        if (inventoryUseAttempt > 6) {
+            logEvent("Resource Builder: popup Transfer resources tidak berhasil dibuka setelah 6 percobaan")
+            inventoryUseAttempt = 0
+            pendingUpgradeUrl = ""
+            goToNextBuilderVillage()
+            return
+        }
+
+        val needed = pendingUpgradeCosts.joinToString(",")
+        val js = """
+            (() => {
+                const needed = [$needed];
+                const visible = el => {
+                    if (!el) return false;
+                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden' &&
+                           r.width > 0 && r.height > 0;
+                };
+                const norm = s => (s || '').replace(/\s+/g,' ').trim().toLowerCase();
+                const isRed = el => {
+                    if (!el) return false;
+                    const s = getComputedStyle(el);
+                    const c = String(s.color || '').toLowerCase();
+                    const cls = String(el.className || '').toLowerCase();
+                    return /red|error|warn|warning|negative|missing|unavailable|bad/.test(cls) ||
+                           c === 'red' || c.includes('255, 0, 0') || c.includes('220, 0, 0') ||
+                           c.includes('200, 0, 0');
+                };
+                const meta = el => [
+                    el.id || '', el.getAttribute('class') || '',
+                    el.getAttribute('data-resource') || '', el.getAttribute('data-type') || '',
+                    el.getAttribute('title') || '', el.getAttribute('aria-label') || ''
+                ].join(' ').toLowerCase();
+
+                // Jika popup sudah terbuka, jangan klik resource lagi.
+                const transferButton = [...document.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]')]
+                    .find(el => visible(el) && !el.disabled &&
+                        /transfer selected/i.test(norm(el.innerText || el.textContent || el.value || el.title || el.getAttribute('aria-label'))));
+                if (transferButton) return 'dialog_ready';
+
+                // Travian React memasang handler khusus pada resource merah untuk membuka
+                // popup transfer Hero. Jangan hanya mencari class/color "red" karena pada
+                // beberapa tema/versi Travian warna tersebut diwariskan dari parent dan
+                // elemen kliknya sendiri tidak mempunyai class red.
+                const transferOpeners = [...document.querySelectorAll('[onclick*="openResourceTransfer"], [data-react-click*="openResourceTransfer"]')]
+                    .filter(visible);
+                if (transferOpeners.length) {
+                    const opener = transferOpeners.find(el => {
+                        const m = meta(el);
+                        return /r1|r2|r3|r4|lumber|clay|iron|crop/.test(m);
+                    }) || transferOpeners[0];
+                    opener.scrollIntoView({block:'center', inline:'center'});
+                    (opener.closest('a,button,[role=button]') || opener).click();
+                    return 'clicked_transfer_opener';
+                }
+
+                const root = document.querySelector('#contract, .buildCosts, .costs, .buildingCosts, .resourceCosts') || document.body;
+                const all = [...root.querySelectorAll('*')].filter(visible);
+                const resourceNames = ['lumber','clay','iron','crop'];
+
+                for (let i=0;i<4;i++) {
+                    if (needed[i] <= 0) continue;
+                    const token = 'r' + (i + 1);
+                    const candidates = all.filter(el => {
+                        const m = meta(el);
+                        return (m.includes(token) || m.includes(resourceNames[i])) && isRed(el);
+                    });
+                    // Pilih elemen terdalam/terkecil yang benar-benar bisa diklik.
+                    candidates.sort((a,b) => {
+                        const ar=a.getBoundingClientRect(), br=b.getBoundingClientRect();
+                        return (ar.width*ar.height) - (br.width*br.height);
+                    });
+                    const target = candidates[0];
+                    if (target) {
+                        target.scrollIntoView({block:'center', inline:'center'});
+                        target.click();
+                        return 'clicked_red:' + (i + 1);
+                    }
+
+                    // Fallback Travian: resource cost biasanya memakai icon img.r1-r4.
+                    const fallback = [...root.querySelectorAll('img.' + token + ', .' + token + ', [class~="' + token + '"]')]
+                        .filter(visible)[0];
+                    if (fallback) {
+                        fallback.scrollIntoView({block:'center', inline:'center'});
+                        (fallback.closest('a,button,[role=button]') || fallback).click();
+                        return 'clicked_fallback:' + (i + 1);
+                    }
+                }
+                return 'resource_not_found';
+            })();
+        """.trimIndent()
+
+        automationWebView()?.evaluateJavascript(js) { raw ->
+            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
+            when {
+                result == "dialog_ready" -> {
+                    handler.postDelayed({ clickTransferSelected() }, 250)
+                }
+                result.startsWith("clicked_red") || result.startsWith("clicked_fallback") || result == "clicked_transfer_opener" -> {
+                    logEvent("Resource Builder: resource merah diklik — menunggu popup Transfer resources")
+                    handler.postDelayed({ clickTransferSelected() }, 650)
+                }
+                result == "resource_not_found" -> {
+                    if (inventoryUseAttempt < 6) {
+                        handler.postDelayed({ clickRedResourceForTransfer() }, 700)
+                    } else {
+                        logEvent("Resource Builder: resource merah untuk Transfer resources tidak ditemukan")
+                        pendingUpgradeUrl = ""
+                        goToNextBuilderVillage()
+                    }
+                }
+                else -> handler.postDelayed({ clickRedResourceForTransfer() }, 700)
+            }
+        }
+    }
+
+    private fun clickTransferSelected(): Unit {
+        debugTrace("ENTER clickTransferSelected")
+        if (!running || !builderInProgress || pendingUpgradeUrl.isBlank()) return
+
+        val js = """
+            (() => {
+                const visible = el => {
+                    if (!el) return false;
+                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                };
+                const norm = s => (s || '').replace(/\s+/g,' ').trim().toLowerCase();
+                const buttons = [...document.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]')]
+                    .filter(visible)
+                    .filter(el => !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+                const btn = buttons.find(el => {
+                    const text = norm(el.innerText || el.textContent || el.value || el.title || el.getAttribute('aria-label'));
+                    return /transfer selected/i.test(text);
+                });
+                if (!btn) return 'not_found';
+                btn.scrollIntoView({block:'center', inline:'center'});
+                btn.click();
+                return 'clicked';
+            })();
+        """.trimIndent()
+
+        automationWebView()?.evaluateJavascript(js) { raw ->
+            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
+            when (result) {
+                "clicked" -> {
+                    logEvent("Resource Builder: Transfer selected diklik; kembali ke halaman resource untuk upgrade")
+                    inventoryUseAttempt = 0
+                    handler.postDelayed({
+                        if (pendingUpgradeUrl.isNotBlank()) {
+                            automationWebView()?.loadUrl(pendingUpgradeUrl)
+                            handler.postDelayed({ inspectUpgradeResources() }, 1200)
+                        }
+                    }, 1000)
+                }
+                else -> {
+                    inventoryUseAttempt++
+                    if (inventoryUseAttempt < 8) {
+                        handler.postDelayed({ clickTransferSelected() }, 700)
+                    } else {
+                        logEvent("Resource Builder: tombol Transfer selected tidak ditemukan")
+                        pendingUpgradeUrl = ""
+                        goToNextBuilderVillage()
+                    }
                 }
             }
         }
